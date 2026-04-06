@@ -1,0 +1,23 @@
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.2.0 https://maven.apache.org/xsd/assembly-2.2.0.xsd">
+    <id>connector-distribution</id>
+    <formats>
+        <format>tar.gz</format>
+        <format>zip</format>
+    </formats>
+    <includeBaseDirectory>true</includeBaseDirectory>
+    <dependencySets>
+        <dependencySet>
+            <outputDirectory>/</outputDirectory>
+            <useProjectArtifact>true</useProjectArtifact>
+            <useTransitiveDependencies>true</useTransitiveDependencies>
+            <excludes>
+                <exclude>org.apache.kafka:connect-api</exclude>
+                <exclude>org.apache.kafka:connect-transforms</exclude>
+                <exclude>org.apache.kafka:kafka-clients</exclude>
+                <exclude>org.slf4j:slf4j-api</exclude>
+            </excludes>
+        </dependencySet>
+    </dependencySets>
+</assembly>
