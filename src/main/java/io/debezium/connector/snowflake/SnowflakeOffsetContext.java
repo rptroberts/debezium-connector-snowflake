@@ -8,6 +8,7 @@ package io.debezium.connector.snowflake;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
@@ -25,9 +26,9 @@ public class SnowflakeOffsetContext implements OffsetContext {
 
     private final SnowflakeSourceInfo sourceInfo;
     private final TransactionContext transactionContext;
-    private boolean snapshotCompleted;
-    private Instant lastPollTimestamp;
-    private final Map<String, String> streamOffsets;
+    private volatile boolean snapshotCompleted;
+    private volatile Instant lastPollTimestamp;
+    private final ConcurrentHashMap<String, String> streamOffsets;
 
     public SnowflakeOffsetContext(SnowflakeConnectorConfig config, boolean snapshotCompleted,
                                   Instant lastPollTimestamp, Map<String, String> streamOffsets) {
@@ -35,7 +36,7 @@ public class SnowflakeOffsetContext implements OffsetContext {
         this.transactionContext = new TransactionContext();
         this.snapshotCompleted = snapshotCompleted;
         this.lastPollTimestamp = lastPollTimestamp;
-        this.streamOffsets = streamOffsets != null ? new HashMap<>(streamOffsets) : new HashMap<>();
+        this.streamOffsets = streamOffsets != null ? new ConcurrentHashMap<>(streamOffsets) : new ConcurrentHashMap<>();
     }
 
     @Override

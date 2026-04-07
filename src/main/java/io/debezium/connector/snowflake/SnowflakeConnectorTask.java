@@ -8,6 +8,7 @@ package io.debezium.connector.snowflake;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTask;
 import org.slf4j.Logger;
@@ -37,16 +38,21 @@ public class SnowflakeConnectorTask extends SourceTask {
         this.connection = new SnowflakeConnection(config);
         try {
             connection.connect();
+
+            this.coordinator = new SnowflakeChangeEventSourceCoordinator(
+                    connectorConfig,
+                    connection,
+                    context);
+            coordinator.start();
         }
         catch (Exception e) {
-            throw new RuntimeException("Failed to connect to Snowflake", e);
+            // Clean up connection if initialization fails partway through
+            if (connection != null) {
+                connection.close();
+                connection = null;
+            }
+            throw new ConnectException("Failed to start Snowflake connector task", e);
         }
-
-        this.coordinator = new SnowflakeChangeEventSourceCoordinator(
-                connectorConfig,
-                connection,
-                context);
-        coordinator.start();
     }
 
     @Override

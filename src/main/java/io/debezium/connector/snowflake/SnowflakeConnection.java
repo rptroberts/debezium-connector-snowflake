@@ -118,9 +118,49 @@ public class SnowflakeConnection implements AutoCloseable {
 
     public Connection getJdbcConnection() throws SQLException {
         if (jdbcConnection == null || jdbcConnection.isClosed()) {
-            connect();
+            connectWithRetry();
+        }
+        else {
+            try {
+                if (!jdbcConnection.isValid(5)) {
+                    LOGGER.warn("Snowflake connection is no longer valid, reconnecting");
+                    close();
+                    connectWithRetry();
+                }
+            }
+            catch (SQLException e) {
+                LOGGER.warn("Connection validation failed, reconnecting", e);
+                close();
+                connectWithRetry();
+            }
         }
         return jdbcConnection;
+    }
+
+    private void connectWithRetry() throws SQLException {
+        int maxRetries = 3;
+        long backoffMs = 1000;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                connect();
+                return;
+            }
+            catch (SQLException e) {
+                if (attempt == maxRetries) {
+                    throw e;
+                }
+                LOGGER.warn("Connection attempt {}/{} failed, retrying in {}ms",
+                        attempt, maxRetries, backoffMs, e);
+                try {
+                    Thread.sleep(backoffMs);
+                }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+                backoffMs *= 2;
+            }
+        }
     }
 
     public void execute(String sql) throws SQLException {
@@ -148,9 +188,32 @@ public class SnowflakeConnection implements AutoCloseable {
         return results;
     }
 
+    public List<Map<String, Object>> queryPrepared(String sql, Object... params) throws SQLException {
+        LOGGER.debug("Querying (prepared): {}", sql);
+        List<Map<String, Object>> results = new ArrayList<>();
+        try (PreparedStatement stmt = getJdbcConnection().prepareStatement(sql)) {
+            for (int i = 0; i < params.length; i++) {
+                stmt.setObject(i + 1, params[i]);
+            }
+            try (ResultSet rs = stmt.executeQuery()) {
+                ResultSetMetaData meta = rs.getMetaData();
+                int columnCount = meta.getColumnCount();
+                while (rs.next()) {
+                    Map<String, Object> row = new HashMap<>();
+                    for (int i = 1; i <= columnCount; i++) {
+                        row.put(meta.getColumnName(i), rs.getObject(i));
+                    }
+                    results.add(row);
+                }
+            }
+        }
+        return results;
+    }
+
     public boolean streamHasData(String streamName) throws SQLException {
-        String sql = "SELECT SYSTEM$STREAM_HAS_DATA('" + streamName + "') AS HAS_DATA";
-        List<Map<String, Object>> result = query(sql);
+        // SYSTEM$STREAM_HAS_DATA takes a string literal (stream name), not an identifier
+        List<Map<String, Object>> result = queryPrepared(
+                "SELECT SYSTEM$STREAM_HAS_DATA(?) AS HAS_DATA", streamName);
         if (!result.isEmpty()) {
             Object value = result.get(0).get("HAS_DATA");
             return "true".equalsIgnoreCase(String.valueOf(value));
@@ -160,15 +223,19 @@ public class SnowflakeConnection implements AutoCloseable {
 
     public void createStream(String streamName, String tableName, String streamType,
                              String atTimestamp) throws SQLException {
+        String quotedStream = SnowflakeIdentifiers.quoteIdentifier(streamName);
+        String quotedTable = SnowflakeIdentifiers.quoteDotSeparatedName(tableName);
+
         StringBuilder sql = new StringBuilder();
-        sql.append("CREATE STREAM IF NOT EXISTS ").append(streamName);
-        sql.append(" ON TABLE ").append(tableName);
+        sql.append("CREATE STREAM IF NOT EXISTS ").append(quotedStream);
+        sql.append(" ON TABLE ").append(quotedTable);
 
         if ("APPEND_ONLY".equalsIgnoreCase(streamType)) {
             sql.append(" APPEND_ONLY = TRUE");
         }
 
         if (atTimestamp != null) {
+            SnowflakeIdentifiers.validateTimestamp(atTimestamp);
             sql.append(" AT(TIMESTAMP => '").append(atTimestamp).append("'::TIMESTAMP_LTZ)");
         }
 
@@ -177,17 +244,21 @@ public class SnowflakeConnection implements AutoCloseable {
     }
 
     public void dropStream(String streamName) throws SQLException {
-        execute("DROP STREAM IF EXISTS " + streamName);
+        String quoted = SnowflakeIdentifiers.quoteIdentifier(streamName);
+        execute("DROP STREAM IF EXISTS " + quoted);
         LOGGER.info("Dropped stream {}", streamName);
     }
 
     public List<Map<String, Object>> consumeStreamViaTemp(String streamName,
                                                            String tempTableName,
                                                            int maxRows) throws SQLException {
+        String quotedStream = SnowflakeIdentifiers.quoteIdentifier(streamName);
+        String quotedTemp = SnowflakeIdentifiers.quoteIdentifier(tempTableName);
+
         // Step 1: Atomically consume stream into temp table
         // Stream columns already include METADATA$ACTION, METADATA$ISUPDATE, METADATA$ROW_ID
-        String createSql = "CREATE OR REPLACE TEMPORARY TABLE " + tempTableName +
-                " AS SELECT * FROM " + streamName;
+        String createSql = "CREATE OR REPLACE TEMPORARY TABLE " + quotedTemp +
+                " AS SELECT * FROM " + quotedStream;
         if (maxRows > 0) {
             createSql += " LIMIT " + maxRows;
         }
@@ -208,11 +279,11 @@ public class SnowflakeConnection implements AutoCloseable {
         }
 
         // Step 2: Read changes from temp table
-        List<Map<String, Object>> changes = query("SELECT * FROM " + tempTableName);
+        List<Map<String, Object>> changes = query("SELECT * FROM " + quotedTemp);
 
         // Step 3: Cleanup
         try {
-            execute("DROP TABLE IF EXISTS " + tempTableName);
+            execute("DROP TABLE IF EXISTS " + quotedTemp);
         }
         catch (SQLException e) {
             LOGGER.warn("Failed to drop temp table {}", tempTableName, e);
@@ -224,39 +295,56 @@ public class SnowflakeConnection implements AutoCloseable {
     public List<Map<String, Object>> queryChanges(String tableName, String fromTimestamp,
                                                    String toTimestamp) throws SQLException {
         // CHANGES clause includes METADATA$ columns automatically
-        String sql = "SELECT * FROM " + tableName +
+        // Table name may be qualified (e.g. SCHEMA.TABLE)
+        String quotedTable = SnowflakeIdentifiers.quoteDotSeparatedName(tableName);
+        SnowflakeIdentifiers.validateTimestamp(fromTimestamp);
+
+        String sql = "SELECT * FROM " + quotedTable +
                 " CHANGES(INFORMATION => DEFAULT)" +
                 " AT(TIMESTAMP => '" + fromTimestamp + "'::TIMESTAMP_LTZ)";
         if (toTimestamp != null) {
+            SnowflakeIdentifiers.validateTimestamp(toTimestamp);
             sql += " END(TIMESTAMP => '" + toTimestamp + "'::TIMESTAMP_LTZ)";
         }
         return query(sql);
     }
 
+    public List<Map<String, Object>> queryAtTimestamp(String tableName,
+                                                       String timestamp) throws SQLException {
+        String quotedTable = SnowflakeIdentifiers.quoteDotSeparatedName(tableName);
+        SnowflakeIdentifiers.validateTimestamp(timestamp);
+        String sql = "SELECT * FROM " + quotedTable +
+                " AT(TIMESTAMP => '" + timestamp + "'::TIMESTAMP_LTZ)";
+        return query(sql);
+    }
+
     public List<Map<String, Object>> describeStream(String streamName) throws SQLException {
-        return query("DESCRIBE STREAM " + streamName);
+        String quoted = SnowflakeIdentifiers.quoteIdentifier(streamName);
+        return query("DESCRIBE STREAM " + quoted);
     }
 
     public List<Map<String, Object>> getTableColumns(String database, String schema,
                                                       String tableName) throws SQLException {
         String sql = "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, " +
                 "NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT, ORDINAL_POSITION " +
-                "FROM " + database + ".INFORMATION_SCHEMA.COLUMNS " +
-                "WHERE TABLE_SCHEMA = '" + schema + "' AND TABLE_NAME = '" + tableName + "' " +
+                "FROM " + SnowflakeIdentifiers.quoteIdentifier(database) + ".INFORMATION_SCHEMA.COLUMNS " +
+                "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? " +
                 "ORDER BY ORDINAL_POSITION";
-        return query(sql);
+        return queryPrepared(sql, schema, tableName);
     }
 
     public List<Map<String, Object>> getPrimaryKeys(String schema, String tableName) throws SQLException {
-        String sql = "SHOW PRIMARY KEYS IN TABLE " + schema + "." + tableName;
+        String sql = "SHOW PRIMARY KEYS IN TABLE " +
+                SnowflakeIdentifiers.quoteQualifiedName(schema, tableName);
         return query(sql);
     }
 
     public List<Map<String, Object>> getTables(String database, String schema) throws SQLException {
-        String sql = "SELECT TABLE_NAME FROM " + database + ".INFORMATION_SCHEMA.TABLES " +
-                "WHERE TABLE_SCHEMA = '" + schema + "' AND TABLE_TYPE = 'BASE TABLE' " +
+        String sql = "SELECT TABLE_NAME FROM " +
+                SnowflakeIdentifiers.quoteIdentifier(database) + ".INFORMATION_SCHEMA.TABLES " +
+                "WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' " +
                 "ORDER BY TABLE_NAME";
-        return query(sql);
+        return queryPrepared(sql, schema);
     }
 
     public String getCurrentTimestamp() throws SQLException {

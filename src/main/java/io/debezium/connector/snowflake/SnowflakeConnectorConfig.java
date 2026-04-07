@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.snowflake;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -387,6 +388,51 @@ public class SnowflakeConnectorConfig extends CommonConnectorConfig {
             }
             return INITIAL;
         }
+    }
+
+    /**
+     * Validates the configuration and returns a list of error messages.
+     * An empty list means the configuration is valid.
+     */
+    public static List<String> validateConfig(Configuration config) {
+        List<String> errors = new ArrayList<>();
+
+        String url = config.getString(URL_FIELD);
+        if (url == null || url.trim().isEmpty()) {
+            errors.add("snowflake.url is required");
+        }
+
+        String user = config.getString(USER_FIELD);
+        if (user == null || user.trim().isEmpty()) {
+            errors.add("snowflake.user is required");
+        }
+
+        String database = config.getString(DATABASE_FIELD);
+        if (database == null || database.trim().isEmpty()) {
+            errors.add("snowflake.database is required");
+        }
+
+        // At least one auth method must be provided
+        String password = config.getString(PASSWORD_FIELD);
+        String privateKey = config.getString(PRIVATE_KEY_FIELD);
+        String privateKeyFile = config.getString(PRIVATE_KEY_FILE_FIELD);
+        boolean hasPassword = password != null && !password.isEmpty();
+        boolean hasPrivateKey = privateKey != null && !privateKey.isEmpty();
+        boolean hasPrivateKeyFile = privateKeyFile != null && !privateKeyFile.isEmpty();
+        if (!hasPassword && !hasPrivateKey && !hasPrivateKeyFile) {
+            errors.add("At least one authentication method must be configured: " +
+                    "snowflake.password, snowflake.private.key, or snowflake.private.key.file");
+        }
+
+        // table.include.list and table.exclude.list cannot both be set
+        List<String> includeList = config.getList(TABLE_INCLUDE_LIST_FIELD);
+        List<String> excludeList = config.getList(TABLE_EXCLUDE_LIST_FIELD);
+        if (includeList != null && !includeList.isEmpty()
+                && excludeList != null && !excludeList.isEmpty()) {
+            errors.add("table.include.list and table.exclude.list cannot both be specified");
+        }
+
+        return errors;
     }
 
     public enum StaleHandlingMode implements EnumeratedValue {

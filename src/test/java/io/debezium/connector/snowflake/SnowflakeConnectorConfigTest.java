@@ -7,6 +7,8 @@ package io.debezium.connector.snowflake;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 
 import io.debezium.config.Configuration;
@@ -121,5 +123,61 @@ class SnowflakeConnectorConfigTest {
                 .isEqualTo(SnowflakeConnectorConfig.StaleHandlingMode.SKIP);
         assertThat(SnowflakeConnectorConfig.StaleHandlingMode.parse("unknown"))
                 .isEqualTo(SnowflakeConnectorConfig.StaleHandlingMode.FAIL);
+    }
+
+    @Test
+    void shouldReportMissingUrl() {
+        Configuration config = Configuration.create()
+                .with("topic.prefix", "test")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_USER, "user")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_PASSWORD, "pass")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_DATABASE, "testdb")
+                .build();
+
+        List<String> errors = SnowflakeConnectorConfig.validateConfig(config);
+        assertThat(errors).anyMatch(e -> e.contains("snowflake.url"));
+    }
+
+    @Test
+    void shouldReportMissingAuth() {
+        Configuration config = Configuration.create()
+                .with("topic.prefix", "test")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_URL, "https://test.snowflakecomputing.com")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_USER, "user")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_DATABASE, "testdb")
+                .build();
+
+        List<String> errors = SnowflakeConnectorConfig.validateConfig(config);
+        assertThat(errors).anyMatch(e -> e.contains("authentication"));
+    }
+
+    @Test
+    void shouldReportConflictingTableLists() {
+        Configuration config = Configuration.create()
+                .with("topic.prefix", "test")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_URL, "https://test.snowflakecomputing.com")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_USER, "user")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_PASSWORD, "pass")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_DATABASE, "testdb")
+                .with(SnowflakeConnectorConfig.TABLE_INCLUDE_LIST, "T1")
+                .with(SnowflakeConnectorConfig.TABLE_EXCLUDE_LIST, "T2")
+                .build();
+
+        List<String> errors = SnowflakeConnectorConfig.validateConfig(config);
+        assertThat(errors).anyMatch(e -> e.contains("table.include.list"));
+    }
+
+    @Test
+    void shouldPassValidConfig() {
+        Configuration config = Configuration.create()
+                .with("topic.prefix", "test")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_URL, "https://test.snowflakecomputing.com")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_USER, "user")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_PASSWORD, "pass")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_DATABASE, "testdb")
+                .build();
+
+        List<String> errors = SnowflakeConnectorConfig.validateConfig(config);
+        assertThat(errors).isEmpty();
     }
 }

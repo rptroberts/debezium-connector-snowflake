@@ -11,7 +11,10 @@ import java.util.Map;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.Task;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceConnector;
+
+import io.debezium.config.Configuration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,6 +31,11 @@ public class SnowflakeConnector extends SourceConnector {
 
     @Override
     public void start(Map<String, String> props) {
+        Configuration config = Configuration.from(props);
+        List<String> errors = SnowflakeConnectorConfig.validateConfig(config);
+        if (!errors.isEmpty()) {
+            throw new ConnectException("Invalid configuration: " + String.join("; ", errors));
+        }
         this.configProperties = Collections.unmodifiableMap(props);
         LOGGER.info("Starting Snowflake connector");
     }
@@ -39,6 +47,7 @@ public class SnowflakeConnector extends SourceConnector {
 
     @Override
     public List<Map<String, String>> taskConfigs(int maxTasks) {
+        // Single-task only: Snowflake CDC streams cannot be parallelized across tasks
         return Collections.singletonList(configProperties);
     }
 
