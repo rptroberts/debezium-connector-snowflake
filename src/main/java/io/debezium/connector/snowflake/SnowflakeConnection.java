@@ -88,6 +88,9 @@ public class SnowflakeConnection implements AutoCloseable {
             }
         }
 
+        // Use JSON result format to avoid Arrow memory issues
+        props.put("JDBC_QUERY_RESULT_FORMAT", "JSON");
+
         LOGGER.info("Connecting to Snowflake at {}", jdbcUrl);
         this.jdbcConnection = DriverManager.getConnection(jdbcUrl, props);
         LOGGER.info("Connected to Snowflake successfully");
@@ -182,9 +185,9 @@ public class SnowflakeConnection implements AutoCloseable {
                                                            String tempTableName,
                                                            int maxRows) throws SQLException {
         // Step 1: Atomically consume stream into temp table
+        // Stream columns already include METADATA$ACTION, METADATA$ISUPDATE, METADATA$ROW_ID
         String createSql = "CREATE OR REPLACE TEMPORARY TABLE " + tempTableName +
-                " AS SELECT *, METADATA$ACTION, METADATA$ISUPDATE, METADATA$ROW_ID" +
-                " FROM " + streamName;
+                " AS SELECT * FROM " + streamName;
         if (maxRows > 0) {
             createSql += " LIMIT " + maxRows;
         }
@@ -220,8 +223,8 @@ public class SnowflakeConnection implements AutoCloseable {
 
     public List<Map<String, Object>> queryChanges(String tableName, String fromTimestamp,
                                                    String toTimestamp) throws SQLException {
-        String sql = "SELECT *, METADATA$ACTION, METADATA$ISUPDATE, METADATA$ROW_ID" +
-                " FROM " + tableName +
+        // CHANGES clause includes METADATA$ columns automatically
+        String sql = "SELECT * FROM " + tableName +
                 " CHANGES(INFORMATION => DEFAULT)" +
                 " AT(TIMESTAMP => '" + fromTimestamp + "'::TIMESTAMP_LTZ)";
         if (toTimestamp != null) {
