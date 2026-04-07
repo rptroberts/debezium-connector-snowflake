@@ -6,12 +6,20 @@
 
     <groupId>io.debezium</groupId>
     <artifactId>debezium-connector-snowflake</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.1.0</version>
     <packaging>jar</packaging>
 
     <name>Debezium Connector for Snowflake</name>
     <description>Debezium source connector for capturing CDC events from Snowflake</description>
     <url>https://github.com/rptroberts/debezium-connector-snowflake</url>
+
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <name>GitHub Packages</name>
+            <url>https://maven.pkg.github.com/rptroberts/debezium-connector-snowflake</url>
+        </repository>
+    </distributionManagement>
 
     <licenses>
         <license>

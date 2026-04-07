@@ -25,6 +25,18 @@ jobs:
       - name: Build and run unit tests
         run: mvn clean test
 
+      - name: Build connector archive
+        run: mvn clean package -Passembly -DskipTests
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debezium-connector-snowflake
+          path: |
+            target/debezium-connector-snowflake-*.tar.gz
+            target/debezium-connector-snowflake-*.zip
+          retention-days: 30
+
   integration-test:
     runs-on: ubuntu-latest
     name: Integration Tests
@@ -59,6 +71,7 @@ jobs:
 
     permissions:
       contents: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +85,11 @@ jobs:
 
       - name: Build connector archive
         run: mvn clean package -Passembly -DskipTests
+
+      - name: Publish to GitHub Packages
+        run: mvn deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

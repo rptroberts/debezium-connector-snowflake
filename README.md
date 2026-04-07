@@ -18,6 +18,62 @@ Snowflake doesn't expose transaction logs like traditional databases. This conne
 - Stream staleness detection and configurable handling
 - Configurable polling interval and batch sizes
 
+## Installation
+
+### Maven Dependency (GitHub Packages)
+
+Add the GitHub Packages repository and dependency to your `pom.xml`:
+
+```xml
+<repositories>
+    <repository>
+        <id>github</id>
+        <url>https://maven.pkg.github.com/rptroberts/debezium-connector-snowflake</url>
+    </repository>
+</repositories>
+
+<dependencies>
+    <dependency>
+        <groupId>io.debezium</groupId>
+        <artifactId>debezium-connector-snowflake</artifactId>
+        <version>0.1.0</version>
+    </dependency>
+</dependencies>
+```
+
+GitHub Packages requires authentication. Add your credentials to `~/.m2/settings.xml`:
+
+```xml
+<settings>
+  <servers>
+    <server>
+      <id>github</id>
+      <username>YOUR_GITHUB_USERNAME</username>
+      <password>YOUR_GITHUB_TOKEN</password>
+    </server>
+  </servers>
+</settings>
+```
+
+The token needs the `read:packages` scope. See [GitHub docs](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-apache-maven-registry) for details.
+
+### Kafka Connect Plugin (from GitHub Releases)
+
+Download the latest release archive from the [Releases page](https://github.com/rptroberts/debezium-connector-snowflake/releases) and extract it to your Kafka Connect `plugin.path`:
+
+```bash
+tar -xzf debezium-connector-snowflake-*.tar.gz -C /path/to/kafka/connect/plugins/
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/rptroberts/debezium-connector-snowflake.git
+cd debezium-connector-snowflake
+mvn clean package -Passembly -DskipTests
+# Extract target/debezium-connector-snowflake-*.tar.gz to your plugin.path
+```
+
 ## Quick Start
 
 ### Prerequisites
@@ -25,21 +81,6 @@ Snowflake doesn't expose transaction logs like traditional databases. This conne
 - Java 17+
 - Apache Kafka with Kafka Connect
 - Snowflake account with appropriate permissions
-
-### Build
-
-```bash
-mvn clean package -DskipTests
-```
-
-### Deploy
-
-Copy the connector JAR and its dependencies to your Kafka Connect plugin path:
-
-```bash
-mvn clean package -Passembly -DskipTests
-# Extract target/debezium-connector-snowflake-0.1.0-SNAPSHOT.tar.gz to your plugin.path
-```
 
 ### Configure
 
