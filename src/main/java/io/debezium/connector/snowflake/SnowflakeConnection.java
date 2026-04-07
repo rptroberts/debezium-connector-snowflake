@@ -249,6 +249,11 @@ public class SnowflakeConnection implements AutoCloseable {
         LOGGER.info("Dropped stream {}", streamName);
     }
 
+    /**
+     * Atomically consumes a Snowflake stream into a temporary table, then reads from it.
+     * The temp table is NOT dropped — caller must call {@link #dropTempTable(String)} after
+     * Kafka Connect has committed the records, to avoid data loss on crash/restart.
+     */
     public List<Map<String, Object>> consumeStreamViaTemp(String streamName,
                                                            String tempTableName,
                                                            int maxRows) throws SQLException {
@@ -257,11 +262,11 @@ public class SnowflakeConnection implements AutoCloseable {
 
         // Step 1: Atomically consume stream into temp table
         // Stream columns already include METADATA$ACTION, METADATA$ISUPDATE, METADATA$ROW_ID
+        // IMPORTANT: No LIMIT clause — Snowflake streams advance past ALL rows when read
+        // in a committed transaction, regardless of LIMIT. Using LIMIT would silently
+        // discard rows beyond the limit since the stream has already advanced past them.
         String createSql = "CREATE OR REPLACE TEMPORARY TABLE " + quotedTemp +
                 " AS SELECT * FROM " + quotedStream;
-        if (maxRows > 0) {
-            createSql += " LIMIT " + maxRows;
-        }
 
         execute("BEGIN");
         try {
@@ -278,18 +283,22 @@ public class SnowflakeConnection implements AutoCloseable {
             throw e;
         }
 
-        // Step 2: Read changes from temp table
-        List<Map<String, Object>> changes = query("SELECT * FROM " + quotedTemp);
+        // Step 2: Read changes from temp table (temp table kept alive for crash recovery)
+        return query("SELECT * FROM " + quotedTemp);
+    }
 
-        // Step 3: Cleanup
+    /**
+     * Drops a temporary table. Called after Kafka Connect has committed the records
+     * that were read from this temp table.
+     */
+    public void dropTempTable(String tempTableName) {
+        String quotedTemp = SnowflakeIdentifiers.quoteIdentifier(tempTableName);
         try {
             execute("DROP TABLE IF EXISTS " + quotedTemp);
         }
         catch (SQLException e) {
             LOGGER.warn("Failed to drop temp table {}", tempTableName, e);
         }
-
-        return changes;
     }
 
     public List<Map<String, Object>> queryChanges(String tableName, String fromTimestamp,

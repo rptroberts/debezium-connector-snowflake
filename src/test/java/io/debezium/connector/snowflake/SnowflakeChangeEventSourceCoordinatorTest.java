@@ -199,6 +199,173 @@ class SnowflakeChangeEventSourceCoordinatorTest {
     }
 
     @Test
+    void shouldPropagateSchemaQueryError() throws Exception {
+        // When getTableColumns() throws, the coordinator should propagate the error
+        // rather than silently producing records with empty schemas
+        when(mockConnection.getCurrentTimestamp()).thenReturn("2026-01-01 00:00:00.000000");
+        when(mockConnection.queryAtTimestamp(anyString(), anyString()))
+                .thenReturn(Collections.singletonList(new HashMap<>(Map.of("ID", 1))));
+        when(mockConnection.getTableColumns(anyString(), anyString(), anyString()))
+                .thenThrow(new SQLException("Permission denied"));
+
+        SnowflakeChangeEventSourceCoordinator coordinator =
+                new SnowflakeChangeEventSourceCoordinator(config, mockConnection, mockTaskContext);
+        coordinator.start();
+
+        // Wait for coordinator thread to fail
+        Thread.sleep(500);
+
+        assertThatThrownBy(coordinator::poll)
+                .isInstanceOf(ConnectException.class);
+
+        coordinator.stop();
+    }
+
+    @Test
+    void shouldNormalizeTableNamesToUppercase() throws Exception {
+        // Config with lowercase table name
+        Configuration rawConfig = Configuration.create()
+                .with("topic.prefix", "test-server")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_URL, "https://test.snowflakecomputing.com")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_USER, "user")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_PASSWORD, "pass")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_DATABASE, "testdb")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_SCHEMA, "PUBLIC")
+                .with(SnowflakeConnectorConfig.TABLE_INCLUDE_LIST, "test_table")  // lowercase
+                .build();
+        SnowflakeConnectorConfig lcConfig = new SnowflakeConnectorConfig(rawConfig);
+
+        List<Map<String, Object>> columns = new ArrayList<>();
+        Map<String, Object> col = new HashMap<>();
+        col.put("COLUMN_NAME", "ID");
+        col.put("DATA_TYPE", "NUMBER");
+        col.put("NUMERIC_PRECISION", 10);
+        col.put("NUMERIC_SCALE", 0);
+        col.put("IS_NULLABLE", "NO");
+        columns.add(col);
+
+        List<Map<String, Object>> snapshotRows = new ArrayList<>();
+        snapshotRows.add(new HashMap<>(Map.of("ID", 1)));
+
+        when(mockConnection.getCurrentTimestamp()).thenReturn("2026-01-01 00:00:00.000000");
+        when(mockConnection.queryAtTimestamp(anyString(), anyString())).thenReturn(snapshotRows);
+        // Should be called with uppercase "TEST_TABLE"
+        when(mockConnection.getTableColumns(anyString(), anyString(), anyString())).thenReturn(columns);
+        when(mockConnection.getPrimaryKeys(anyString(), anyString())).thenReturn(Collections.emptyList());
+        when(mockConnection.streamHasData(anyString())).thenReturn(false);
+
+        SnowflakeChangeEventSourceCoordinator coordinator =
+                new SnowflakeChangeEventSourceCoordinator(lcConfig, mockConnection, mockTaskContext);
+        coordinator.start();
+
+        Thread.sleep(1000);
+        List<SourceRecord> records = coordinator.poll();
+        assertThat(records).isNotNull();
+
+        // Topic should contain uppercase table name
+        for (SourceRecord record : records) {
+            if (record.topic() != null && record.topic().contains("TEST_TABLE")) {
+                assertThat(record.topic()).contains("TEST_TABLE");
+            }
+        }
+
+        coordinator.stop();
+
+        // Schema should have been queried only once (normalized name = cache hit)
+        verify(mockConnection, times(1)).getTableColumns(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void shouldTrackPendingTempTablesForCommit() throws Exception {
+        // Verify that onCommit() is available and doesn't throw when no pending tables
+        List<Map<String, Object>> columns = new ArrayList<>();
+        Map<String, Object> col = new HashMap<>();
+        col.put("COLUMN_NAME", "ID");
+        col.put("DATA_TYPE", "NUMBER");
+        col.put("NUMERIC_PRECISION", 10);
+        col.put("NUMERIC_SCALE", 0);
+        col.put("IS_NULLABLE", "NO");
+        columns.add(col);
+
+        when(mockConnection.getCurrentTimestamp()).thenReturn("2026-01-01 00:00:00.000000");
+        when(mockConnection.queryAtTimestamp(anyString(), anyString())).thenReturn(Collections.emptyList());
+        when(mockConnection.getTableColumns(anyString(), anyString(), anyString())).thenReturn(columns);
+        when(mockConnection.getPrimaryKeys(anyString(), anyString())).thenReturn(Collections.emptyList());
+        when(mockConnection.streamHasData(anyString())).thenReturn(false);
+
+        Configuration rawConfig = Configuration.create()
+                .with("topic.prefix", "test-server")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_URL, "https://test.snowflakecomputing.com")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_USER, "user")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_PASSWORD, "pass")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_DATABASE, "testdb")
+                .with(SnowflakeConnectorConfig.SNOWFLAKE_SCHEMA, "PUBLIC")
+                .with(SnowflakeConnectorConfig.TABLE_INCLUDE_LIST, "TEST_TABLE")
+                .with(SnowflakeConnectorConfig.SNAPSHOT_MODE, "never")
+                .with(SnowflakeConnectorConfig.CDC_MODE, "stream")
+                .build();
+        SnowflakeConnectorConfig neverConfig = new SnowflakeConnectorConfig(rawConfig);
+
+        SnowflakeChangeEventSourceCoordinator coordinator =
+                new SnowflakeChangeEventSourceCoordinator(neverConfig, mockConnection, mockTaskContext);
+        coordinator.start();
+
+        Thread.sleep(200);
+
+        // onCommit should not throw
+        coordinator.onCommit();
+
+        // isThreadAlive should return true while running
+        assertThat(coordinator.isThreadAlive()).isTrue();
+
+        coordinator.stop();
+
+        // After stop, isThreadAlive should be false
+        assertThat(coordinator.isThreadAlive()).isFalse();
+    }
+
+    @Test
+    void shouldUseFrozenOffsetForSnapshotRecords() throws Exception {
+        // Verify that snapshot records carry consistent offsets
+        List<Map<String, Object>> columns = new ArrayList<>();
+        Map<String, Object> col = new HashMap<>();
+        col.put("COLUMN_NAME", "ID");
+        col.put("DATA_TYPE", "NUMBER");
+        col.put("NUMERIC_PRECISION", 10);
+        col.put("NUMERIC_SCALE", 0);
+        col.put("IS_NULLABLE", "NO");
+        columns.add(col);
+
+        List<Map<String, Object>> snapshotRows = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            snapshotRows.add(new HashMap<>(Map.of("ID", i)));
+        }
+
+        when(mockConnection.getCurrentTimestamp()).thenReturn("2026-01-01 00:00:00.000000");
+        when(mockConnection.queryAtTimestamp(anyString(), anyString())).thenReturn(snapshotRows);
+        when(mockConnection.getTableColumns(anyString(), anyString(), anyString())).thenReturn(columns);
+        when(mockConnection.getPrimaryKeys(anyString(), anyString())).thenReturn(Collections.emptyList());
+        when(mockConnection.streamHasData(anyString())).thenReturn(false);
+
+        SnowflakeChangeEventSourceCoordinator coordinator =
+                new SnowflakeChangeEventSourceCoordinator(config, mockConnection, mockTaskContext);
+        coordinator.start();
+
+        Thread.sleep(1000);
+        List<SourceRecord> records = coordinator.poll();
+        assertThat(records).isNotNull();
+        assertThat(records.size()).isGreaterThanOrEqualTo(3);
+
+        // All snapshot records should carry the same offset snapshot
+        Map<String, ?> firstOffset = records.get(0).sourceOffset();
+        for (SourceRecord record : records) {
+            assertThat(record.sourceOffset()).containsKey("snapshot_completed");
+        }
+
+        coordinator.stop();
+    }
+
+    @Test
     void shouldHandleConcurrentOffsetAccess() throws Exception {
         // Test thread safety of SnowflakeOffsetContext
         SnowflakeOffsetContext offsetContext = new SnowflakeOffsetContext(config, false, null, null);

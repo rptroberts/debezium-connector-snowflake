@@ -117,11 +117,11 @@ public class SnowflakeOffsetContext implements OffsetContext {
     }
 
     public void updateStreamOffset(String tableName, String timestamp) {
-        streamOffsets.put(tableName, timestamp);
+        streamOffsets.put(tableName.toUpperCase(), timestamp);
     }
 
     public String getStreamOffset(String tableName) {
-        return streamOffsets.get(tableName);
+        return streamOffsets.get(tableName.toUpperCase());
     }
 
     public Map<String, String> getStreamOffsets() {
@@ -149,7 +149,7 @@ public class SnowflakeOffsetContext implements OffsetContext {
             Map<String, String> streamOffsets = new HashMap<>();
             for (Map.Entry<String, ?> entry : offset.entrySet()) {
                 if (entry.getKey().startsWith(STREAM_OFFSET_PREFIX) && entry.getValue() != null) {
-                    String tableName = entry.getKey().substring(STREAM_OFFSET_PREFIX.length());
+                    String tableName = entry.getKey().substring(STREAM_OFFSET_PREFIX.length()).toUpperCase();
                     streamOffsets.put(tableName, entry.getValue().toString());
                 }
             }

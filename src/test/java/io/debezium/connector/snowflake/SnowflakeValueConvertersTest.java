@@ -6,11 +6,13 @@
 package io.debezium.connector.snowflake;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.junit.jupiter.api.Test;
 
@@ -110,6 +112,115 @@ class SnowflakeValueConvertersTest {
     void shouldConvertNullValues() {
         assertThat(SnowflakeValueConverters.convertValue(null, Schema.STRING_SCHEMA)).isNull();
         assertThat(SnowflakeValueConverters.convertValue(null, Schema.INT32_SCHEMA)).isNull();
+    }
+
+    // --- Tests for nullable schema parameter preservation (Bug 1A) ---
+
+    @Test
+    void shouldPreserveDecimalParametersWhenNullable() {
+        Map<String, Object> meta = createMeta(10, 2);
+        Schema schema = SnowflakeValueConverters.toConnectSchema("NUMBER", meta, true);
+        assertThat(schema.isOptional()).isTrue();
+        assertThat(schema.name()).isEqualTo(Decimal.LOGICAL_NAME);
+        assertThat(schema.parameters()).isNotNull();
+        assertThat(schema.parameters()).containsEntry("scale", "2");
+
+        // Round-trip through Decimal serialization should not throw NPE
+        BigDecimal value = new BigDecimal("123.45");
+        byte[] bytes = Decimal.fromLogical(schema, value);
+        BigDecimal roundTripped = Decimal.toLogical(schema, bytes);
+        assertThat(roundTripped).isEqualByComparingTo(value);
+    }
+
+    @Test
+    void shouldPreserveTimestampVersionWhenNullable() {
+        Map<String, Object> meta = createMeta(null, null);
+        Schema schema = SnowflakeValueConverters.toConnectSchema("TIMESTAMP_NTZ", meta, true);
+        assertThat(schema.isOptional()).isTrue();
+        assertThat(schema.name()).isEqualTo(org.apache.kafka.connect.data.Timestamp.LOGICAL_NAME);
+        assertThat(schema.version()).isEqualTo(org.apache.kafka.connect.data.Timestamp.SCHEMA.version());
+    }
+
+    @Test
+    void shouldPreserveDateVersionWhenNullable() {
+        Map<String, Object> meta = createMeta(null, null);
+        Schema schema = SnowflakeValueConverters.toConnectSchema("DATE", meta, true);
+        assertThat(schema.isOptional()).isTrue();
+        assertThat(schema.name()).isEqualTo(org.apache.kafka.connect.data.Date.LOGICAL_NAME);
+    }
+
+    // --- Tests for String-to-numeric conversion (Bug 1C) ---
+
+    @Test
+    void shouldConvertStringToInt32() {
+        assertThat(SnowflakeValueConverters.convertValue("42", Schema.INT32_SCHEMA)).isEqualTo(42);
+    }
+
+    @Test
+    void shouldConvertStringToInt64() {
+        assertThat(SnowflakeValueConverters.convertValue("9999999999", Schema.INT64_SCHEMA))
+                .isEqualTo(9999999999L);
+    }
+
+    @Test
+    void shouldConvertStringToFloat32() {
+        assertThat(SnowflakeValueConverters.convertValue("2.5", Schema.FLOAT32_SCHEMA)).isEqualTo(2.5f);
+    }
+
+    @Test
+    void shouldConvertStringToFloat64() {
+        assertThat(SnowflakeValueConverters.convertValue("3.14", Schema.FLOAT64_SCHEMA)).isEqualTo(3.14);
+    }
+
+    @Test
+    void shouldConvertBigDecimalToInt32() {
+        assertThat(SnowflakeValueConverters.convertValue(new BigDecimal("42"), Schema.INT32_SCHEMA))
+                .isEqualTo(42);
+    }
+
+    @Test
+    void shouldThrowOnInvalidStringToInt() {
+        assertThatThrownBy(() -> SnowflakeValueConverters.convertValue("abc", Schema.INT32_SCHEMA))
+                .isInstanceOf(NumberFormatException.class);
+    }
+
+    // --- Tests for boolean conversion from numeric values (Bug 1D) ---
+
+    @Test
+    void shouldConvertIntegerOneToTrue() {
+        assertThat(SnowflakeValueConverters.convertValue(1, Schema.BOOLEAN_SCHEMA)).isEqualTo(true);
+    }
+
+    @Test
+    void shouldConvertIntegerZeroToFalse() {
+        assertThat(SnowflakeValueConverters.convertValue(0, Schema.BOOLEAN_SCHEMA)).isEqualTo(false);
+    }
+
+    @Test
+    void shouldConvertNonZeroIntegerToTrue() {
+        assertThat(SnowflakeValueConverters.convertValue(42, Schema.BOOLEAN_SCHEMA)).isEqualTo(true);
+    }
+
+    @Test
+    void shouldConvertString1ToTrue() {
+        assertThat(SnowflakeValueConverters.convertValue("1", Schema.BOOLEAN_SCHEMA)).isEqualTo(true);
+    }
+
+    @Test
+    void shouldConvertString0ToFalse() {
+        assertThat(SnowflakeValueConverters.convertValue("0", Schema.BOOLEAN_SCHEMA)).isEqualTo(false);
+    }
+
+    @Test
+    void shouldConvertStringTrueToTrueCaseInsensitive() {
+        assertThat(SnowflakeValueConverters.convertValue("TRUE", Schema.BOOLEAN_SCHEMA)).isEqualTo(true);
+        assertThat(SnowflakeValueConverters.convertValue("True", Schema.BOOLEAN_SCHEMA)).isEqualTo(true);
+    }
+
+    @Test
+    void shouldConvertStringFalseToFalse() {
+        assertThat(SnowflakeValueConverters.convertValue("false", Schema.BOOLEAN_SCHEMA)).isEqualTo(false);
+        assertThat(SnowflakeValueConverters.convertValue("FALSE", Schema.BOOLEAN_SCHEMA)).isEqualTo(false);
     }
 
     private Map<String, Object> createMeta(Integer precision, Integer scale) {

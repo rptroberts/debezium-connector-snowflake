@@ -18,8 +18,12 @@ import java.util.Map;
 import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class SnowflakeValueConverters {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(SnowflakeValueConverters.class);
 
     private SnowflakeValueConverters() {
     }
@@ -28,10 +32,18 @@ public final class SnowflakeValueConverters {
                                           boolean nullable) {
         Schema schema = mapType(snowflakeType, columnMeta);
         if (nullable) {
-            return SchemaBuilder.type(schema.type())
+            SchemaBuilder builder = SchemaBuilder.type(schema.type())
                     .name(schema.name())
-                    .optional()
-                    .build();
+                    .optional();
+            if (schema.parameters() != null) {
+                for (Map.Entry<String, String> entry : schema.parameters().entrySet()) {
+                    builder.parameter(entry.getKey(), entry.getValue());
+                }
+            }
+            if (schema.version() != null) {
+                builder.version(schema.version());
+            }
+            return builder.build();
         }
         return schema;
     }
@@ -144,22 +156,34 @@ public final class SnowflakeValueConverters {
 
         switch (targetSchema.type()) {
             case INT32:
-                return ((Number) value).intValue();
+                if (value instanceof Number) return ((Number) value).intValue();
+                if (value instanceof String) return Integer.parseInt((String) value);
+                throw new IllegalArgumentException("Cannot convert " + value.getClass().getName() + " to INT32");
 
             case INT64:
-                return ((Number) value).longValue();
+                if (value instanceof Number) return ((Number) value).longValue();
+                if (value instanceof String) return Long.parseLong((String) value);
+                throw new IllegalArgumentException("Cannot convert " + value.getClass().getName() + " to INT64");
 
             case FLOAT32:
-                return ((Number) value).floatValue();
+                if (value instanceof Number) return ((Number) value).floatValue();
+                if (value instanceof String) return Float.parseFloat((String) value);
+                throw new IllegalArgumentException("Cannot convert " + value.getClass().getName() + " to FLOAT32");
 
             case FLOAT64:
-                return ((Number) value).doubleValue();
+                if (value instanceof Number) return ((Number) value).doubleValue();
+                if (value instanceof String) return Double.parseDouble((String) value);
+                throw new IllegalArgumentException("Cannot convert " + value.getClass().getName() + " to FLOAT64");
 
             case BOOLEAN:
-                if (value instanceof Boolean) {
-                    return value;
+                if (value instanceof Boolean) return value;
+                if (value instanceof Number) return ((Number) value).intValue() != 0;
+                if (value instanceof String) {
+                    String s = ((String) value).trim().toLowerCase();
+                    if ("true".equals(s) || "1".equals(s)) return true;
+                    if ("false".equals(s) || "0".equals(s)) return false;
                 }
-                return Boolean.parseBoolean(String.valueOf(value));
+                throw new IllegalArgumentException("Cannot convert " + value + " to Boolean");
 
             case STRING:
                 return String.valueOf(value);

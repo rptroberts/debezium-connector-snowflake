@@ -61,13 +61,29 @@ public class SnowflakeConnectorTask extends SourceTask {
     }
 
     @Override
+    public void commit() throws InterruptedException {
+        super.commit();
+        if (coordinator != null) {
+            coordinator.onCommit();
+        }
+    }
+
+    @Override
     public void stop() {
         LOGGER.info("Stopping Snowflake connector task");
         if (coordinator != null) {
             coordinator.stop();
         }
+        // Only close connection after coordinator has fully stopped to avoid
+        // killing JDBC connection under an in-flight transaction
         if (connection != null) {
-            connection.close();
+            if (coordinator == null || !coordinator.isThreadAlive()) {
+                connection.close();
+            }
+            else {
+                LOGGER.warn("Coordinator thread still alive after stop timeout; "
+                        + "deferring connection close to avoid mid-transaction interruption");
+            }
         }
     }
 }

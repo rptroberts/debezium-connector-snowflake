@@ -9,8 +9,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,6 +42,16 @@ public class SnowflakeChangeEventSourceCoordinator {
     // Schema caches to avoid per-row metadata queries
     private final Map<String, Schema> valueSchemaCache = new HashMap<>();
     private final Map<String, Schema> keySchemaCache = new HashMap<>();
+    private final Map<String, Schema> envelopeSchemaCache = new HashMap<>();
+    private final Map<String, Schema> optionalValueSchemaCache = new HashMap<>();
+    private final Map<String, Long> schemaCacheExpiry = new HashMap<>();
+    private static final long SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+    // Pending temp tables awaiting Kafka Connect commit before cleanup
+    private final List<String> pendingTempTables = new CopyOnWriteArrayList<>();
+
+    // Frozen offset snapshot used for all records in a single polling cycle
+    private volatile Map<String, ?> frozenOffset;
 
     // Table discovery cache
     private List<String> cachedTables;
@@ -209,27 +221,49 @@ public class SnowflakeChangeEventSourceCoordinator {
         while (running.get()) {
             boolean hasData = false;
 
+            // Phase 1: Freeze current offset snapshot for all records in this cycle.
+            // This prevents multi-table offset leapfrog — all records carry the
+            // pre-cycle offset, so committing any record is safe.
+            frozenOffset = new HashMap<>(offsetContext.getOffset());
+
+            // Phase 2: Collect changes from all tables
+            Map<String, List<Map<String, Object>>> allChanges = new LinkedHashMap<>();
+            Map<String, String> pendingTimestamps = new HashMap<>(); // changes mode only
+
             for (String table : tables) {
                 if (!running.get()) {
                     break;
                 }
 
-                List<Map<String, Object>> changes;
                 if (config.getCdcMode() == SnowflakeConnectorConfig.CdcMode.STREAM) {
-                    changes = pollStreamMode(table);
+                    List<Map<String, Object>> changes = pollStreamMode(table);
+                    if (changes != null && !changes.isEmpty()) {
+                        allChanges.put(table, changes);
+                    }
                 }
                 else {
-                    changes = pollChangesMode(table);
-                }
-
-                if (changes != null && !changes.isEmpty()) {
-                    hasData = true;
-                    processChanges(table, changes);
-                    offsetContext.setLastPollTimestamp(Instant.now());
+                    ChangesResult result = pollChangesMode(table);
+                    if (result.changes != null && !result.changes.isEmpty()) {
+                        allChanges.put(table, result.changes);
+                        pendingTimestamps.put(table, result.currentTimestamp);
+                    }
                 }
             }
 
-            if (!hasData) {
+            // Phase 3: Enqueue all records (using frozen offset via createChangeRecord)
+            for (Map.Entry<String, List<Map<String, Object>>> entry : allChanges.entrySet()) {
+                hasData = true;
+                processChanges(entry.getKey(), entry.getValue());
+            }
+
+            // Phase 4: Advance all offsets atomically AFTER all records are enqueued
+            for (Map.Entry<String, String> entry : pendingTimestamps.entrySet()) {
+                offsetContext.updateStreamOffset(entry.getKey(), entry.getValue());
+            }
+            if (hasData) {
+                offsetContext.setLastPollTimestamp(Instant.now());
+            }
+            else {
                 Thread.sleep(pollIntervalMs);
             }
         }
@@ -254,8 +288,19 @@ public class SnowflakeChangeEventSourceCoordinator {
         String tempTableName = "_DBZ_CHANGES_" + table.toUpperCase().replace(".", "_")
                 + "_" + System.currentTimeMillis();
 
-        return connection.consumeStreamViaTemp(streamName, tempTableName,
+        List<Map<String, Object>> changes = connection.consumeStreamViaTemp(streamName, tempTableName,
                 config.getStreamMaxRowsPerPoll());
+
+        // Track temp table for deferred cleanup after Kafka Connect commit
+        if (changes != null && !changes.isEmpty()) {
+            pendingTempTables.add(tempTableName);
+        }
+        else {
+            // No data — safe to drop immediately
+            connection.dropTempTable(tempTableName);
+        }
+
+        return changes;
     }
 
     private boolean isStaleStreamError(Exception e) {
@@ -285,7 +330,7 @@ public class SnowflakeChangeEventSourceCoordinator {
         }
     }
 
-    private List<Map<String, Object>> pollChangesMode(String table) throws Exception {
+    private ChangesResult pollChangesMode(String table) throws Exception {
         String fullTableName = config.getSnowflakeSchema() + "." + table;
         // queryChanges internally quotes the table name
         String lastTimestamp = offsetContext.getStreamOffset(table);
@@ -293,20 +338,34 @@ public class SnowflakeChangeEventSourceCoordinator {
         if (lastTimestamp == null) {
             // Only reached when snapshot.mode=never (snapshot seeds offsets otherwise)
             lastTimestamp = connection.getCurrentTimestamp();
+            LOGGER.warn("No prior offset found for table '{}'. With snapshot.mode=never, " +
+                    "change tracking begins from the current timestamp ({}). " +
+                    "Pre-existing data will NOT be captured. Use snapshot.mode=initial " +
+                    "to capture existing data.", table, lastTimestamp);
             offsetContext.updateStreamOffset(table, lastTimestamp);
-            return Collections.emptyList();
+            return new ChangesResult(Collections.emptyList(), lastTimestamp);
         }
 
         String currentTimestamp = connection.getCurrentTimestamp();
         List<Map<String, Object>> changes = connection.queryChanges(
                 fullTableName, lastTimestamp, currentTimestamp);
 
-        // Only advance offset if we actually received changes to avoid skipping a window
-        if (changes != null && !changes.isEmpty()) {
-            offsetContext.updateStreamOffset(table, currentTimestamp);
-        }
+        // Offset advancement is deferred to executeStreaming() after all records are enqueued
+        return new ChangesResult(changes, currentTimestamp);
+    }
 
-        return changes;
+    /**
+     * Holds the result of a changes-mode poll: the rows plus the timestamp to use
+     * for advancing the offset (only after records are safely enqueued).
+     */
+    private static class ChangesResult {
+        final List<Map<String, Object>> changes;
+        final String currentTimestamp;
+
+        ChangesResult(List<Map<String, Object>> changes, String currentTimestamp) {
+            this.changes = changes;
+            this.currentTimestamp = currentTimestamp;
+        }
     }
 
     private void processChanges(String tableName, List<Map<String, Object>> changes) throws Exception {
@@ -391,7 +450,11 @@ public class SnowflakeChangeEventSourceCoordinator {
     private List<String> resolveTables() {
         List<String> includeList = config.getTableIncludeList();
         if (includeList != null && !includeList.isEmpty()) {
-            return includeList;
+            List<String> normalized = new ArrayList<>();
+            for (String t : includeList) {
+                normalized.add(t.toUpperCase());
+            }
+            return normalized;
         }
 
         // Return cached table list if still valid
@@ -422,17 +485,21 @@ public class SnowflakeChangeEventSourceCoordinator {
     }
 
     private Schema buildSchemaForTable(String tableName) {
-        Schema cached = valueSchemaCache.get(tableName);
-        if (cached != null) {
-            return cached;
+        String normalizedName = tableName.toUpperCase();
+        Long expiry = schemaCacheExpiry.get(normalizedName);
+        if (expiry != null && System.currentTimeMillis() < expiry) {
+            Schema cached = valueSchemaCache.get(normalizedName);
+            if (cached != null) {
+                return cached;
+            }
         }
 
         try {
             List<Map<String, Object>> columns = connection.getTableColumns(
-                    config.getSnowflakeDatabase(), config.getSnowflakeSchema(), tableName);
+                    config.getSnowflakeDatabase(), config.getSnowflakeSchema(), normalizedName);
 
             SchemaBuilder builder = SchemaBuilder.struct()
-                    .name(config.getLogicalName() + "." + config.getSnowflakeSchema() + "." + tableName + ".Value");
+                    .name(config.getLogicalName() + "." + config.getSnowflakeSchema() + "." + normalizedName + ".Value");
 
             Map<String, Schema> columnSchemas = new HashMap<>();
             for (Map<String, Object> col : columns) {
@@ -446,16 +513,28 @@ public class SnowflakeChangeEventSourceCoordinator {
             }
 
             Schema valueSchema = builder.build();
-            valueSchemaCache.put(tableName, valueSchema);
+
+            // Detect schema changes
+            Schema previousSchema = valueSchemaCache.get(normalizedName);
+            if (previousSchema != null && previousSchema.fields().size() != valueSchema.fields().size()) {
+                LOGGER.info("Schema change detected for table {}: {} fields -> {} fields",
+                        normalizedName, previousSchema.fields().size(), valueSchema.fields().size());
+            }
+
+            valueSchemaCache.put(normalizedName, valueSchema);
+            keySchemaCache.remove(normalizedName);
+            envelopeSchemaCache.remove(normalizedName);
+            optionalValueSchemaCache.remove(normalizedName);
+            schemaCacheExpiry.put(normalizedName, System.currentTimeMillis() + SCHEMA_CACHE_TTL_MS);
 
             // Build key schema from primary keys
-            buildKeySchemaForTable(tableName, columnSchemas);
+            buildKeySchemaForTable(normalizedName, columnSchemas);
 
             return valueSchema;
         }
         catch (Exception e) {
-            LOGGER.warn("Failed to build schema for table {}, using generic schema", tableName, e);
-            return SchemaBuilder.struct().name(tableName + ".Value").build();
+            LOGGER.error("Failed to build schema for table {}", normalizedName, e);
+            throw new ConnectException("Cannot build schema for table " + normalizedName + ": " + e.getMessage(), e);
         }
     }
 
@@ -488,7 +567,7 @@ public class SnowflakeChangeEventSourceCoordinator {
     }
 
     private Schema getKeySchemaForTable(String tableName) {
-        return keySchemaCache.get(tableName);
+        return keySchemaCache.get(tableName.toUpperCase());
     }
 
     private SourceRecord createSnapshotRecord(String tableName, Map<String, Object> row,
@@ -500,20 +579,29 @@ public class SnowflakeChangeEventSourceCoordinator {
                                              Map<String, Object> beforeRow,
                                              Map<String, Object> afterRow,
                                              Schema valueSchema) {
+        String normalizedName = tableName.toUpperCase();
         String topicName = config.getLogicalName() + "." +
                 config.getSnowflakeDatabase() + "." +
-                config.getSnowflakeSchema() + "." + tableName;
+                config.getSnowflakeSchema() + "." + normalizedName;
 
         // Build envelope schema — before/after must be optional (null for inserts/deletes/snapshots)
-        Schema optionalValueSchema = makeOptional(valueSchema);
-        Schema envelopeSchema = SchemaBuilder.struct()
-                .name(topicName + ".Envelope")
-                .field("before", optionalValueSchema)
-                .field("after", optionalValueSchema)
-                .field("source", SnowflakeSourceInfo.SCHEMA)
-                .field("op", Schema.STRING_SCHEMA)
-                .field("ts_ms", Schema.INT64_SCHEMA)
-                .build();
+        Schema optionalValueSchema = optionalValueSchemaCache.get(normalizedName);
+        if (optionalValueSchema == null) {
+            optionalValueSchema = makeOptional(valueSchema);
+            optionalValueSchemaCache.put(normalizedName, optionalValueSchema);
+        }
+        Schema envelopeSchema = envelopeSchemaCache.get(normalizedName);
+        if (envelopeSchema == null) {
+            envelopeSchema = SchemaBuilder.struct()
+                    .name(topicName + ".Envelope")
+                    .field("before", optionalValueSchema)
+                    .field("after", optionalValueSchema)
+                    .field("source", SnowflakeSourceInfo.SCHEMA)
+                    .field("op", Schema.STRING_SCHEMA)
+                    .field("ts_ms", Schema.INT64_SCHEMA)
+                    .build();
+            envelopeSchemaCache.put(normalizedName, envelopeSchema);
+        }
 
         // Build source info
         offsetContext.event(new SnowflakeTableId(config.getSnowflakeDatabase(),
@@ -538,9 +626,14 @@ public class SnowflakeChangeEventSourceCoordinator {
             }
         }
 
+        // Use frozen offset snapshot to prevent multi-table offset leapfrog.
+        // During streaming, frozenOffset is set before each polling cycle.
+        // During snapshot, frozenOffset is null so we use live offset.
+        Map<String, ?> offset = frozenOffset != null ? frozenOffset : offsetContext.getOffset();
+
         return new SourceRecord(
                 partition.getSourcePartition(),
-                offsetContext.getOffset(),
+                offset,
                 topicName,
                 keySchema,
                 keyStruct,
@@ -571,7 +664,13 @@ public class SnowflakeChangeEventSourceCoordinator {
             }
             catch (Exception e) {
                 LOGGER.warn("Failed to convert value for field {}: {}", field.name(), e.getMessage());
-                struct.put(field.name(), null);
+                if (field.schema().isOptional()) {
+                    struct.put(field.name(), null);
+                }
+                else {
+                    throw new ConnectException(
+                            "Failed to convert required field '" + field.name() + "': " + e.getMessage(), e);
+                }
             }
         }
         return struct;
@@ -592,20 +691,40 @@ public class SnowflakeChangeEventSourceCoordinator {
         return records.isEmpty() ? null : records;
     }
 
+    /**
+     * Called by SnowflakeConnectorTask.commit() after Kafka Connect has committed records.
+     * Drops any pending temp tables that were kept alive for crash recovery.
+     */
+    public void onCommit() {
+        if (!pendingTempTables.isEmpty()) {
+            List<String> toCleanup = new ArrayList<>(pendingTempTables);
+            pendingTempTables.clear();
+            for (String tempTable : toCleanup) {
+                connection.dropTempTable(tempTable);
+            }
+        }
+    }
+
+    public boolean isThreadAlive() {
+        return coordinatorThread != null && coordinatorThread.isAlive();
+    }
+
     public void stop() {
         running.set(false);
         if (coordinatorThread != null) {
             coordinatorThread.interrupt();
             try {
-                coordinatorThread.join(5000);
+                coordinatorThread.join(10000);
                 if (coordinatorThread.isAlive()) {
-                    LOGGER.warn("Coordinator thread did not stop within 5 seconds");
+                    LOGGER.warn("Coordinator thread did not stop within 10 seconds");
                 }
             }
             catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
+        // Clean up any remaining temp tables
+        onCommit();
         LOGGER.info("Snowflake change event source coordinator stopped");
     }
 }

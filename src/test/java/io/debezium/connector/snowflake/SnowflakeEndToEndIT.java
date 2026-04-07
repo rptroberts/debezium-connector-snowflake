@@ -458,6 +458,167 @@ class SnowflakeEndToEndIT {
         }
     }
 
+    /**
+     * Tests that boolean values are correctly converted (not corrupted by parseBoolean).
+     * Verifies the fix for numeric boolean conversion (Bug 1D).
+     */
+    @Test
+    void shouldProduceCorrectBooleanValues() throws Exception {
+        SnowflakeConnectorTask task = new SnowflakeConnectorTask();
+
+        Map<String, String> props = buildTaskProps("stream");
+        props.put("table.include.list", CUSTOMERS_TABLE);
+
+        task.initialize(createMockTaskContext());
+        task.start(props);
+
+        try {
+            List<SourceRecord> snapshots = pollUntilCount(task, 3, 30);
+            assertThat(snapshots).hasSize(3);
+
+            // Alice (ID=1) has ACTIVE=TRUE
+            Struct alice = findRecordByFieldValue(snapshots, "ID", 1);
+            assertThat(alice).isNotNull();
+            assertThat(alice.getStruct("after").get("ACTIVE")).isEqualTo(true);
+
+            // Charlie (ID=3) has ACTIVE=FALSE
+            Struct charlie = findRecordByFieldValue(snapshots, "ID", 3);
+            assertThat(charlie).isNotNull();
+            assertThat(charlie.getStruct("after").get("ACTIVE")).isEqualTo(false);
+
+            LOGGER.info("Boolean value conversion validation passed");
+        }
+        finally {
+            task.stop();
+        }
+    }
+
+    /**
+     * Tests that NUMBER(12,2) decimal values are preserved with exact precision.
+     * Verifies the fix for nullable schema parameter loss (Bug 1A).
+     */
+    @Test
+    void shouldProduceCorrectDecimalValues() throws Exception {
+        SnowflakeConnectorTask task = new SnowflakeConnectorTask();
+
+        Map<String, String> props = buildTaskProps("stream");
+        props.put("table.include.list", CUSTOMERS_TABLE);
+
+        task.initialize(createMockTaskContext());
+        task.start(props);
+
+        try {
+            List<SourceRecord> snapshots = pollUntilCount(task, 3, 30);
+            assertThat(snapshots).hasSize(3);
+
+            // Alice (ID=1) has BALANCE=1500.50
+            Struct alice = findRecordByFieldValue(snapshots, "ID", 1);
+            assertThat(alice).isNotNull();
+            Object balance = alice.getStruct("after").get("BALANCE");
+            assertThat(balance).isNotNull();
+            // Should be a BigDecimal or convertible to one with correct value
+            LOGGER.info("BALANCE type: {}, value: {}", balance.getClass().getSimpleName(), balance);
+            assertThat(new java.math.BigDecimal(balance.toString()))
+                    .isEqualByComparingTo(new java.math.BigDecimal("1500.50"));
+
+            LOGGER.info("Decimal value precision validation passed");
+        }
+        finally {
+            task.stop();
+        }
+    }
+
+    /**
+     * Tests that the connector shuts down gracefully while actively streaming.
+     * Verifies the fix for safe connection shutdown (Bug 3E).
+     */
+    @Test
+    void shouldShutdownGracefullyUnderLoad() throws Exception {
+        SnowflakeConnectorTask task = new SnowflakeConnectorTask();
+
+        Map<String, String> props = buildTaskProps("stream");
+        props.put("table.include.list", CUSTOMERS_TABLE + "," + ORDERS_TABLE);
+
+        task.initialize(createMockTaskContext());
+        task.start(props);
+
+        try {
+            // Consume snapshot
+            pollUntilCount(task, 5, 30);
+
+            // Insert some data to keep streams active
+            try (Statement stmt = directConnection.createStatement()) {
+                for (int i = 10; i < 20; i++) {
+                    stmt.execute("INSERT INTO " + CUSTOMERS_TABLE +
+                            " (ID, NAME, EMAIL, BALANCE, ACTIVE) VALUES " +
+                            "(" + i + ", 'User " + i + "', 'user" + i + "@example.com', " + (i * 100) + ".00, TRUE)");
+                }
+            }
+
+            Thread.sleep(1000);
+        }
+        finally {
+            // This should not throw or hang
+            task.stop();
+            LOGGER.info("Graceful shutdown under load validation passed");
+        }
+    }
+
+    /**
+     * Tests that multi-table streaming doesn't lose data when tables have
+     * different change rates. Verifies offset consistency (Bug 3C).
+     */
+    @Test
+    void shouldHandleMultiTableOffsetConsistency() throws Exception {
+        SnowflakeConnectorTask task = new SnowflakeConnectorTask();
+
+        Map<String, String> props = buildTaskProps("stream");
+        props.put("table.include.list", CUSTOMERS_TABLE + "," + ORDERS_TABLE);
+
+        task.initialize(createMockTaskContext());
+        task.start(props);
+
+        try {
+            // Consume snapshot (3 customers + 2 orders = 5)
+            List<SourceRecord> snapshots = pollUntilCount(task, 5, 30);
+            assertThat(snapshots).hasSize(5);
+
+            Thread.sleep(2000);
+
+            // Insert different amounts into each table
+            try (Statement stmt = directConnection.createStatement()) {
+                // 3 customers
+                stmt.execute("INSERT INTO " + CUSTOMERS_TABLE +
+                        " (ID, NAME, EMAIL, BALANCE, ACTIVE) VALUES " +
+                        "(21, 'A1', 'a1@test.com', 100.00, TRUE)");
+                stmt.execute("INSERT INTO " + CUSTOMERS_TABLE +
+                        " (ID, NAME, EMAIL, BALANCE, ACTIVE) VALUES " +
+                        "(22, 'A2', 'a2@test.com', 200.00, TRUE)");
+                stmt.execute("INSERT INTO " + CUSTOMERS_TABLE +
+                        " (ID, NAME, EMAIL, BALANCE, ACTIVE) VALUES " +
+                        "(23, 'A3', 'a3@test.com', 300.00, FALSE)");
+                // 1 order
+                stmt.execute("INSERT INTO " + ORDERS_TABLE +
+                        " (ORDER_ID, CUSTOMER_ID, PRODUCT, QUANTITY, PRICE, STATUS) VALUES " +
+                        "(201, 21, 'Widget B', 5, 49.99, 'NEW')");
+            }
+
+            // Should get all 4 records
+            List<SourceRecord> changes = pollUntilCount(task, 4, 30);
+            assertThat(changes).hasSize(4);
+
+            List<SourceRecord> custChanges = filterByTopic(changes, CUSTOMERS_TABLE);
+            List<SourceRecord> orderChanges = filterByTopic(changes, ORDERS_TABLE);
+            assertThat(custChanges).hasSize(3);
+            assertThat(orderChanges).hasSize(1);
+
+            LOGGER.info("Multi-table offset consistency validation passed");
+        }
+        finally {
+            task.stop();
+        }
+    }
+
     // --- Helper methods ---
 
     private Map<String, String> buildTaskProps(String cdcMode) {

@@ -13,7 +13,7 @@ import java.util.regex.Pattern;
 public final class SnowflakeIdentifiers {
 
     private static final Pattern TIMESTAMP_PATTERN = Pattern.compile(
-            "^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}");
+            "^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?( ?[+-]\\d{2}:?\\d{2})?$");
 
     private SnowflakeIdentifiers() {
     }
@@ -78,7 +78,7 @@ public final class SnowflakeIdentifiers {
         if (timestamp == null || timestamp.isEmpty()) {
             throw new IllegalArgumentException("Timestamp must not be null or empty");
         }
-        if (!TIMESTAMP_PATTERN.matcher(timestamp).find()) {
+        if (!TIMESTAMP_PATTERN.matcher(timestamp).matches()) {
             throw new IllegalArgumentException(
                     "Invalid timestamp format: " + timestamp + ". Expected format like 2024-01-15 10:30:00");
         }

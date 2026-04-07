@@ -23,4 +23,11 @@ class SnowflakeConnectorTaskTest {
         // stop() should not throw even if start() was never called
         task.stop();
     }
+
+    @Test
+    void shouldCommitGracefullyWhenNeverStarted() throws InterruptedException {
+        SnowflakeConnectorTask task = new SnowflakeConnectorTask();
+        // commit() should not throw even if start() was never called
+        task.commit();
+    }
 }

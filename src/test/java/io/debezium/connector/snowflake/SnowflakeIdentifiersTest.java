@@ -92,4 +92,63 @@ class SnowflakeIdentifiersTest {
         assertThatThrownBy(() -> SnowflakeIdentifiers.validateTimestamp("'; DROP TABLE users; --"))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void shouldRejectTimestampWithSqlInjectionSuffix() {
+        // This was the primary SQL injection vector — valid prefix + malicious suffix
+        assertThatThrownBy(() -> SnowflakeIdentifiers.validateTimestamp(
+                "2024-01-15 10:30:00'; DROP TABLE users; --"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectTimestampWithUnionSelect() {
+        assertThatThrownBy(() -> SnowflakeIdentifiers.validateTimestamp(
+                "2024-01-15 10:30:00' UNION SELECT * FROM credentials --"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectTimestampWithTrailingGarbage() {
+        assertThatThrownBy(() -> SnowflakeIdentifiers.validateTimestamp(
+                "2024-01-15 10:30:00 extra"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldAcceptTimestampWithFractionalSeconds() {
+        String ts = "2026-01-15 10:30:00.123456789";
+        assertThat(SnowflakeIdentifiers.validateTimestamp(ts)).isEqualTo(ts);
+    }
+
+    @Test
+    void shouldAcceptTimestampWithTimezoneOffset() {
+        String ts = "2026-01-15T10:30:00+00:00";
+        assertThat(SnowflakeIdentifiers.validateTimestamp(ts)).isEqualTo(ts);
+    }
+
+    @Test
+    void shouldAcceptTimestampWithCompactTimezone() {
+        String ts = "2026-01-15T10:30:00+0000";
+        assertThat(SnowflakeIdentifiers.validateTimestamp(ts)).isEqualTo(ts);
+    }
+
+    @Test
+    void shouldAcceptTimestampWithNegativeTimezone() {
+        String ts = "2026-01-15T10:30:00-05:00";
+        assertThat(SnowflakeIdentifiers.validateTimestamp(ts)).isEqualTo(ts);
+    }
+
+    @Test
+    void shouldAcceptTimestampWithSpaceSeparatedTimezone() {
+        // Snowflake getCurrentTimestamp() returns this format
+        String ts = "2026-04-06 22:00:08.503 -0700";
+        assertThat(SnowflakeIdentifiers.validateTimestamp(ts)).isEqualTo(ts);
+    }
+
+    @Test
+    void shouldAcceptBasicTimestampWithoutFractional() {
+        String ts = "2026-01-15 10:30:00";
+        assertThat(SnowflakeIdentifiers.validateTimestamp(ts)).isEqualTo(ts);
+    }
 }

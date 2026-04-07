@@ -94,6 +94,37 @@ class SnowflakeOffsetContextTest {
     }
 
     @Test
+    void shouldNormalizeTableNameCaseInStreamOffsets() {
+        SnowflakeOffsetContext context = new SnowflakeOffsetContext(config, false, null, null);
+
+        // Store with lowercase
+        context.updateStreamOffset("orders", "2026-03-15T10:00:00Z");
+        // Retrieve with uppercase — should find the same entry
+        assertThat(context.getStreamOffset("ORDERS")).isEqualTo("2026-03-15T10:00:00Z");
+        // Retrieve with mixed case
+        assertThat(context.getStreamOffset("Orders")).isEqualTo("2026-03-15T10:00:00Z");
+
+        // Should not create duplicate entries
+        context.updateStreamOffset("ORDERS", "2026-03-15T11:00:00Z");
+        assertThat(context.getStreamOffsets()).hasSize(1);
+        assertThat(context.getStreamOffset("orders")).isEqualTo("2026-03-15T11:00:00Z");
+    }
+
+    @Test
+    void shouldNormalizeCaseDuringOffsetLoad() {
+        // Simulate loading an offset with a lowercase table name (backward compat)
+        Map<String, Object> rawOffset = new HashMap<>();
+        rawOffset.put("snapshot_completed", true);
+        rawOffset.put("stream_offset_orders", "2026-03-15T10:00:00Z");
+
+        SnowflakeOffsetContext.Loader loader = new SnowflakeOffsetContext.Loader(config);
+        SnowflakeOffsetContext restored = loader.load(rawOffset);
+
+        // Should be accessible via uppercase
+        assertThat(restored.getStreamOffset("ORDERS")).isEqualTo("2026-03-15T10:00:00Z");
+    }
+
+    @Test
     void shouldProduceSourceInfoStruct() {
         SnowflakeOffsetContext context = new SnowflakeOffsetContext(config, false, null, null);
 
